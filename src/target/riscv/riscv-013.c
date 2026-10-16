@@ -1813,6 +1813,8 @@ static int halt_set_dcsr_config(struct target *target)
 						 "Some harts may be unexpectedly halted.", target->smp_id);
 	}
 
+	if (result == ERROR_OK)
+		result = target_smp_sync_halted(target);
 	return result;
 }
 
@@ -3083,7 +3085,7 @@ static int deassert_reset(struct target *target)
 		target->debug_reason = DBG_REASON_NOTHALTED;
 	}
 	info->dcsr_register_is_set = dcsr_config_equals_reset_value(target);
-	return ERROR_OK;
+	return target_smp_sync_halted(target);
 }
 
 static int execute_autofence(struct target *target)

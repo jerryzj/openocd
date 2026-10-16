@@ -236,6 +236,9 @@ int breakpoint_add(struct target *target,
 	enum breakpoint_type type)
 {
 	if (target->smp && type == BKPT_HARD) {
+		int retval = target_smp_sync_halted(target);
+		if (retval != ERROR_OK)
+			return retval;
 		struct target_list *list_node;
 		foreach_smp_target(list_node, target->smp_targets) {
 			struct target *curr = list_node->target;
@@ -256,11 +259,14 @@ int context_breakpoint_add(struct target *target,
 	enum breakpoint_type type)
 {
 	if (target->smp) {
+		int retval = target_smp_sync_halted(target);
+		if (retval != ERROR_OK)
+			return retval;
 		struct target_list *head;
 
 		foreach_smp_target(head, target->smp_targets) {
 			struct target *curr = head->target;
-			int retval = context_breakpoint_add_internal(curr, asid, length, type);
+			retval = context_breakpoint_add_internal(curr, asid, length, type);
 			if (retval != ERROR_OK)
 				return retval;
 		}
@@ -278,11 +284,14 @@ int hybrid_breakpoint_add(struct target *target,
 	enum breakpoint_type type)
 {
 	if (target->smp) {
+		int retval = target_smp_sync_halted(target);
+		if (retval != ERROR_OK)
+			return retval;
 		struct target_list *head;
 
 		foreach_smp_target(head, target->smp_targets) {
 			struct target *curr = head->target;
-			int retval = hybrid_breakpoint_add_internal(curr, address, asid, length, type);
+			retval = hybrid_breakpoint_add_internal(curr, address, asid, length, type);
 			if (retval != ERROR_OK)
 				return retval;
 		}
@@ -569,11 +578,14 @@ int watchpoint_add(struct target *target, target_addr_t address,
 		unsigned int length, enum watchpoint_rw rw, uint64_t value, uint64_t mask)
 {
 	if (target->smp) {
+		int retval = target_smp_sync_halted(target);
+		if (retval != ERROR_OK)
+			return retval;
 		struct target_list *head;
 
 		foreach_smp_target(head, target->smp_targets) {
 			struct target *curr = head->target;
-			int retval = watchpoint_add_internal(curr, address, length, rw, value, mask);
+			retval = watchpoint_add_internal(curr, address, length, rw, value, mask);
 			if (retval != ERROR_OK)
 				return retval;
 		}

@@ -534,6 +534,37 @@ int target_halt(struct target *target)
 	return ERROR_OK;
 }
 
+int target_smp_sync_halted(struct target *target)
+{
+	if (!target->smp)
+		return ERROR_OK;
+
+	bool halted = false;
+	bool running = false;
+	struct target_list *entry;
+	foreach_smp_target(entry, target->smp_targets) {
+		struct target *t = entry->target;
+		if (t->state == TARGET_UNAVAILABLE)
+			continue;
+		/* The hart just examined is not marked examined until the caller
+		 * returns. Count it anyway; skip other not-yet-examined harts. */
+		if (t != target && !target_was_examined(t))
+			continue;
+		if (t->state == TARGET_HALTED)
+			halted = true;
+		else if (t->state == TARGET_RUNNING || t->state == TARGET_DEBUG_RUNNING)
+			running = true;
+	}
+	if (!halted || !running)
+		return ERROR_OK;
+
+	LOG_TARGET_DEBUG(target, "SMP group is stopped; halting running members");
+	int retval = target_halt(target);
+	if (retval != ERROR_OK)
+		return retval;
+	return target_wait_state(target, TARGET_HALTED, 1000);
+}
+
 /**
  * Make the target (re)start executing using its saved execution
  * context (possibly with some modifications).
@@ -701,8 +732,9 @@ int target_examine_one(struct target *target)
 	target_set_examined(target);
 	target_call_event_callbacks(target, TARGET_EVENT_EXAMINE_END);
 
+	retval = target_smp_sync_halted(target);
 	LOG_TARGET_INFO(target, "Examination succeed");
-	return ERROR_OK;
+	return retval;
 }
 
 static int jtag_enable_callback(enum jtag_event event, void *priv)
@@ -5398,7 +5430,7 @@ COMMAND_HANDLER(handle_target_examine)
 
 	target_set_examined(target);
 
-	return ERROR_OK;
+	return target_smp_sync_halted(target);
 }
 
 COMMAND_HANDLER(handle_target_was_examined)
