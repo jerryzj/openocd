@@ -125,10 +125,18 @@ proc ocd_process_reset_inner { MODE } {
 				set err [catch "$t arp_examine allow-defer"]
 				if { $err } {
 					$t invoke-event examine-fail
-					return -code error [format "TARGET: %s - Not examined" $t]
+					# an unavailable target is skipped below
+					if { [$t curstate] != "unavailable" } {
+						return -code error [format "TARGET: %s - Not examined" $t]
+					}
 				} else {
 					$t invoke-event examine-end
 				}
+			}
+
+			# no need to wait for a target that is unavailable anyway
+			if { [$t curstate] == "unavailable" } {
+				continue
 			}
 
 			# Wait up to 1 second for target to halt. Why 1sec? Cause
@@ -142,7 +150,7 @@ proc ocd_process_reset_inner { MODE } {
 			# Did we succeed?
 			set s [$t curstate]
 
-			if { $s != "halted" } {
+			if { $s != "halted" && $s != "unavailable" } {
 				return -code error [format "TARGET: %s - Not halted" $t]
 			}
 		}
@@ -158,6 +166,9 @@ proc ocd_process_reset_inner { MODE } {
 			# don't wait for targets where examination is deferred
 			# they can not be halted anyway at this point
 			if { ![$t was_examined] && [$t examine_deferred] } {
+				continue
+			}
+			if { [$t curstate] == "unavailable" } {
 				continue
 			}
 

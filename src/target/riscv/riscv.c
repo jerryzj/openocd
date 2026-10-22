@@ -753,7 +753,9 @@ static void riscv_deinit_target(struct target *target)
 	if (!tt)
 		LOG_TARGET_ERROR(target, "Could not identify target type.");
 
-	if (riscv_reg_flush_all(target) != ERROR_OK)
+	/* Unexamined targets may still own per-target allocations, but they won't
+	 * have dirty register state to flush. */
+	if (target_was_examined(target) && riscv_reg_flush_all(target) != ERROR_OK)
 		LOG_TARGET_ERROR(target, "Failed to flush registers. Ignoring this error.");
 
 	if (tt && info && info->version_specific)
@@ -2758,27 +2760,26 @@ int riscv_halt(struct target *target)
 
 	LOG_TARGET_DEBUG(target, "halting all harts");
 
+	/* Only halt a hart if it has been examined (was available) */
 	int result = ERROR_OK;
 	if (target->smp) {
 		struct target_list *tlist;
 		foreach_smp_target(tlist, target->smp_targets) {
 			struct target *t = tlist->target;
-			if (halt_prep(t) != ERROR_OK)
+			if (target_was_examined(t) && halt_prep(t) != ERROR_OK)
 				result = ERROR_FAIL;
 		}
 
 		foreach_smp_target(tlist, target->smp_targets) {
 			struct target *t = tlist->target;
 			struct riscv_info *i = riscv_info(t);
-			if (i->prepped) {
-				if (halt_go(t) != ERROR_OK)
-					result = ERROR_FAIL;
-			}
+			if (target_was_examined(t) && i->prepped && halt_go(t) != ERROR_OK)
+				result = ERROR_FAIL;
 		}
 
 		foreach_smp_target(tlist, target->smp_targets) {
 			struct target *t = tlist->target;
-			if (halt_finish(t) != ERROR_OK)
+			if (target_was_examined(t) && halt_finish(t) != ERROR_OK)
 				return ERROR_FAIL;
 		}
 
@@ -2988,6 +2989,8 @@ static int riscv_resume(struct target *target,
 	foreach_smp_target_direction(resume_order == RO_NORMAL, tlist, targets) {
 		struct target *t = tlist->target;
 		LOG_TARGET_DEBUG(t, "target->state=%s", target_state_name(t));
+		/* Don't resume a hart left prepped by an earlier, unfinished sequence. */
+		riscv_info(t)->prepped = false;
 		if (t->state != TARGET_HALTED)
 			LOG_TARGET_DEBUG(t, "skipping this target: target not halted");
 		else if (resume_prep(t, current, address, handle_breakpoints,
@@ -4079,14 +4082,17 @@ static int riscv_poll_hart(struct target *target, enum riscv_next_action *next_a
 				return ERROR_FAIL;
 			break;
 
-		case RISCV_STATE_UNAVAILABLE:
-			LOG_TARGET_DEBUG(target, "  became unavailable");
-			LOG_TARGET_INFO(target, "became unavailable.");
+		case RISCV_STATE_UNAVAILABLE: {
+			const char *was = previous_riscv_state == RISCV_STATE_HALTED ? " (halted)" :
+				previous_riscv_state == RISCV_STATE_RUNNING ? " (running)" : "";
+			LOG_TARGET_DEBUG(target, "  became unavailable%s", was);
+			LOG_TARGET_INFO(target, "became unavailable%s.", was);
 			target->state = TARGET_UNAVAILABLE;
 			if (r->handle_became_unavailable &&
 					r->handle_became_unavailable(target, previous_riscv_state) != ERROR_OK)
 				return ERROR_FAIL;
 			break;
+		}
 
 		case RISCV_STATE_NON_EXISTENT:
 			LOG_TARGET_ERROR(target, "Hart is non-existent!");
