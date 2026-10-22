@@ -2958,6 +2958,14 @@ static int init_target(struct command_context *cmd_ctx,
 	return ERROR_OK;
 }
 
+/* dmcontrol selecting this hart, with haltreq set or cleared. */
+static uint32_t riscv013_dmcontrol(struct target *target, bool haltreq)
+{
+	RISCV013_INFO(info);
+	uint32_t control = set_dmcontrol_hartsel(DM_DMCONTROL_DMACTIVE, info->index);
+	return set_field(control, DM_DMCONTROL_HALTREQ, haltreq ? 1 : 0);
+}
+
 static int assert_reset(struct target *target)
 {
 	RISCV013_INFO(info);
@@ -2973,10 +2981,7 @@ static int assert_reset(struct target *target)
 		if (!dm)
 			return ERROR_FAIL;
 
-		uint32_t control = set_field(0, DM_DMCONTROL_DMACTIVE, 1);
-		control = set_dmcontrol_hartsel(control, info->index);
-		control = set_field(control, DM_DMCONTROL_HALTREQ,
-				target->reset_halt ? 1 : 0);
+		uint32_t control = riscv013_dmcontrol(target, target->reset_halt);
 		control = set_field(control, DM_DMCONTROL_NDMRESET, 1);
 		/* If `abstractcs.busy` is set, debugger should not
 		 * change `hartsel` or set `haltreq`
@@ -3009,6 +3014,37 @@ static bool dcsr_config_equals_reset_value(const struct target *target)
 	return !config->dcsr_cetrig;
 }
 
+/* Poll dmstatus until `field` is set; `what` names it for the log. */
+static int riscv013_wait_for_reset_condition(struct target *target, uint32_t field,
+		const char *what, uint32_t *dmstatus)
+{
+	RISCV013_INFO(info);
+	const unsigned int orig_base_delay = riscv_scan_get_delay(&info->learned_delays,
+			RISCV_DELAY_BASE);
+	int64_t then = timeval_ms() + 1000 * riscv_get_command_timeout_sec();
+	int result;
+
+	LOG_TARGET_DEBUG(target, "Waiting for hart to %s.", what);
+	while (true) {
+		result = dmstatus_read(target, dmstatus, true);
+		if (result != ERROR_OK)
+			break;
+		if (timeval_ms() > then) {
+			LOG_TARGET_ERROR(target, "Hart didn't %s in %ds; dmstatus=0x%x. "
+					"Increase the timeout with riscv set_command_timeout_sec.",
+					what, riscv_get_command_timeout_sec(), *dmstatus);
+			result = ERROR_TIMEOUT_REACHED;
+			break;
+		}
+		if (get_field(*dmstatus, field))
+			break;
+		usleep(10);
+	}
+
+	riscv_scan_set_delay(&info->learned_delays, RISCV_DELAY_BASE, orig_base_delay);
+	return result;
+}
+
 static int deassert_reset(struct target *target)
 {
 	RISCV013_INFO(info);
@@ -3019,10 +3055,7 @@ static int deassert_reset(struct target *target)
 
 	select_dmi(target->tap);
 	/* Clear the reset, but make sure haltreq is still set */
-	uint32_t control = 0;
-	control = set_field(control, DM_DMCONTROL_DMACTIVE, 1);
-	control = set_field(control, DM_DMCONTROL_HALTREQ, target->reset_halt ? 1 : 0);
-	control = set_dmcontrol_hartsel(control, info->index);
+	uint32_t control = riscv013_dmcontrol(target, target->reset_halt);
 	/* If `abstractcs.busy` is set, debugger should not
 	 * change `hartsel`.
 	 */
@@ -3037,34 +3070,22 @@ static int deassert_reset(struct target *target)
 		return result;
 
 	uint32_t dmstatus;
-	const unsigned int orig_base_delay = riscv_scan_get_delay(&info->learned_delays,
-			RISCV_DELAY_BASE);
-	int64_t then = timeval_ms() + 1000 * riscv_get_command_timeout_sec();
-	LOG_TARGET_DEBUG(target, "Waiting for hart to come out of reset.");
-	do {
-		result = dmstatus_read(target, &dmstatus, true);
+	result = riscv013_wait_for_reset_condition(target, DM_DMSTATUS_ALLHAVERESET,
+			"leave reset", &dmstatus);
+	if (result != ERROR_OK)
+		return result;
+
+	/* If reset-halt was requested and hart is not unavailable,
+	 * wait for the hart to actually halt. */
+	if (target->reset_halt && !get_field(dmstatus, DM_DMSTATUS_ALLUNAVAIL)) {
+		result = riscv013_wait_for_reset_condition(target, DM_DMSTATUS_ALLHALTED,
+				"halt", &dmstatus);
 		if (result != ERROR_OK)
 			return result;
-
-		if (timeval_ms() > then) {
-			LOG_TARGET_ERROR(target, "Hart didn't leave reset in %ds; "
-					"dmstatus=0x%x (allunavail=%s, allhavereset=%s); "
-					"Increase the timeout with riscv set_command_timeout_sec.",
-					riscv_get_command_timeout_sec(), dmstatus,
-					get_field(dmstatus, DM_DMSTATUS_ALLUNAVAIL) ? "true" : "false",
-					get_field(dmstatus, DM_DMSTATUS_ALLHAVERESET) ? "true" : "false");
-			return ERROR_TIMEOUT_REACHED;
-		}
-	} while (!get_field(dmstatus, DM_DMSTATUS_ALLHAVERESET));
-
-	riscv_scan_set_delay(&info->learned_delays, RISCV_DELAY_BASE,
-			orig_base_delay);
+	}
 
 	/* Ack reset and clear DM_DMCONTROL_HALTREQ if previously set */
-	control = 0;
-	control = set_field(control, DM_DMCONTROL_DMACTIVE, 1);
-	control = set_field(control, DM_DMCONTROL_ACKHAVERESET, 1);
-	control = set_dmcontrol_hartsel(control, info->index);
+	control = set_field(riscv013_dmcontrol(target, false), DM_DMCONTROL_ACKHAVERESET, 1);
 	result = dm_write(target, DM_DMCONTROL, control);
 	if (result != ERROR_OK)
 		return result;
