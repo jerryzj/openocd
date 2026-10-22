@@ -711,9 +711,16 @@ int target_examine_one(struct target *target)
 
 	int retval = target->type->examine(target);
 	if (retval != ERROR_OK) {
-		LOG_TARGET_ERROR(target, "Examination failed");
-		LOG_TARGET_DEBUG(target, "examine() returned error code %d", retval);
 		target_reset_examined(target);
+		if (target->state == TARGET_UNAVAILABLE) {
+			/* Not reachable for now (e.g. a powered-down hart). Keep it
+			 * polled so handle_target() retries the examine with back-off. */
+			LOG_TARGET_DEBUG(target, "unavailable, examine will be retried");
+			target->active_polled = true;
+		} else {
+			LOG_TARGET_ERROR(target, "Examination failed");
+			LOG_TARGET_DEBUG(target, "examine() returned error code %d", retval);
+		}
 		target_call_event_callbacks(target, TARGET_EVENT_EXAMINE_FAIL);
 		return retval;
 	}
@@ -2940,7 +2947,9 @@ static int handle_one_target(struct target *target)
 	if (res == ERROR_OK)
 		return res;
 
-	LOG_TARGET_ERROR(target, "Polling failed, trying to reexamine");
+	/* An unavailable target that was never examined is retried quietly. */
+	if (target_was_examined(target) || target->state != TARGET_UNAVAILABLE)
+		LOG_TARGET_ERROR(target, "Polling failed, trying to reexamine");
 	target_reset_examined(target);
 	return target_examine_one(target);
 }
