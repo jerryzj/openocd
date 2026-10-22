@@ -36,6 +36,7 @@
 #include "field_helpers.h"
 
 static int riscv013_on_step_or_resume(struct target *target, bool step);
+static uint32_t riscv013_dmcontrol(struct target *target, bool haltreq);
 static int riscv013_step_or_resume_current_hart(struct target *target,
 		bool step);
 static int riscv013_clear_abstract_error(struct target *target);
@@ -246,6 +247,11 @@ typedef struct {
 
 	/* This hart was placed into a halt group in examine(). */
 	bool haltgroup_supported;
+
+	/* Set by deassert_reset() when it left haltreq latched on an
+	 * unavailable hart; dm013_select_hart() must preserve it until
+	 * cleared (on halt, or before resume/step). */
+	bool haltreq_pending;
 } riscv013_info_t;
 
 static OOCD_LIST_HEAD(dm_list);
@@ -2842,23 +2848,21 @@ static int riscv013_get_hart_state(struct target *target, enum riscv_hart_state 
 		LOG_TARGET_DEBUG(target, "Hart unexpectedly reset!");
 		info->dcsr_register_is_set = false;
 		/* TODO: Can we make this more obvious to eg. a gdb user? */
-		uint32_t dmcontrol = DM_DMCONTROL_DMACTIVE |
-			DM_DMCONTROL_ACKHAVERESET;
-		dmcontrol = set_dmcontrol_hartsel(dmcontrol, info->index);
 		/* If we had been halted when we reset, request another halt. If we
 		 * ended up running out of reset, then the user will (hopefully) get a
 		 * message that a reset happened, that the target is running, and then
 		 * that it is halted again once the request goes through.
 		 */
-		if (target->state == TARGET_HALTED) {
-			dmcontrol |= DM_DMCONTROL_HALTREQ;
+		const bool want_halt = target->state == TARGET_HALTED || info->haltreq_pending;
+		if (want_halt) {
 			/* `haltreq` should not be issued if `abstractcs.busy`
 			 * is set. */
 			int result = wait_for_idle_if_needed(target);
 			if (result != ERROR_OK)
 				return result;
 		}
-		dm_write(target, DM_DMCONTROL, dmcontrol);
+		dm_write(target, DM_DMCONTROL,
+				set_field(riscv013_dmcontrol(target, want_halt), DM_DMCONTROL_ACKHAVERESET, 1));
 	}
 	if (get_field(dmstatus, DM_DMSTATUS_ALLNONEXISTENT)) {
 		*state = RISCV_STATE_NON_EXISTENT;
@@ -2870,6 +2874,13 @@ static int riscv013_get_hart_state(struct target *target, enum riscv_hart_state 
 	}
 	if (get_field(dmstatus, DM_DMSTATUS_ALLHALTED)) {
 		*state = RISCV_STATE_HALTED;
+		/* Halt observed; clear any haltreq we latched for this hart. */
+		if (info->haltreq_pending) {
+			int result = dm_write(target, DM_DMCONTROL, riscv013_dmcontrol(target, false));
+			if (result != ERROR_OK)
+				return result;
+		}
+		info->haltreq_pending = false;
 		return ERROR_OK;
 	}
 	if (get_field(dmstatus, DM_DMSTATUS_ALLRUNNING)) {
@@ -2995,6 +3006,8 @@ static int assert_reset(struct target *target)
 		result = dm_write(target, DM_DMCONTROL, control);
 		if (result != ERROR_OK)
 			return result;
+		/* Keep current_hartid in sync with the hart this write selected. */
+		dm->current_hartid = info->index;
 	}
 
 	target->state = TARGET_RESET;
@@ -3045,6 +3058,46 @@ static int riscv013_wait_for_reset_condition(struct target *target, uint32_t fie
 	return result;
 }
 
+/* After ackhavereset: wait for the halt, or confirm the hart is still
+ * unavailable and leave haltreq latched for dm013_select_hart(). */
+static int deassert_reset_finish_haltreq(struct target *target, uint32_t *dmstatus)
+{
+	RISCV013_INFO(info);
+
+	/* Assume still latched until confirmed otherwise. */
+	info->haltreq_pending = true;
+
+	/* Re-sample: leave-reset may finish via allhavereset while still unavail. */
+	int result = dmstatus_read(target, dmstatus, true);
+	if (result != ERROR_OK)
+		return result;
+
+	/* Require two consecutive allunavail samples (with a short settle
+	 * between them) before trusting it - a single sample can be a
+	 * transient artifact of reset. */
+	if (get_field(*dmstatus, DM_DMSTATUS_ALLUNAVAIL)) {
+		usleep(10);
+		result = dmstatus_read(target, dmstatus, true);
+		if (result != ERROR_OK)
+			return result;
+	}
+
+	/* Still unavail: leave haltreq asserted for when it becomes available. */
+	if (get_field(*dmstatus, DM_DMSTATUS_ALLUNAVAIL))
+		return ERROR_OK;
+
+	result = riscv013_wait_for_reset_condition(target, DM_DMSTATUS_ALLHALTED, "halt", dmstatus);
+	if (result != ERROR_OK)
+		return result;
+
+	/* Halt observed: drop haltreq. */
+	result = dm_write(target, DM_DMCONTROL, riscv013_dmcontrol(target, false));
+	if (result != ERROR_OK)
+		return result;
+	info->haltreq_pending = false;
+	return ERROR_OK;
+}
+
 static int deassert_reset(struct target *target)
 {
 	RISCV013_INFO(info);
@@ -3054,7 +3107,11 @@ static int deassert_reset(struct target *target)
 	int result;
 
 	select_dmi(target->tap);
-	/* Clear the reset, but make sure haltreq is still set */
+
+	/* Recomputed below; don't carry over any earlier latch. */
+	info->haltreq_pending = false;
+
+	/* 1) Deassert ndmreset; keep haltreq if reset-halt. */
 	uint32_t control = riscv013_dmcontrol(target, target->reset_halt);
 	/* If `abstractcs.busy` is set, debugger should not
 	 * change `hartsel`.
@@ -3068,28 +3125,30 @@ static int deassert_reset(struct target *target)
 	result = dm_write(target, DM_DMCONTROL, control);
 	if (result != ERROR_OK)
 		return result;
+	/* Keep current_hartid in sync with the hart this write selected. */
+	dm->current_hartid = info->index;
 
+	/* 2) Wait until out of reset. */
 	uint32_t dmstatus;
 	result = riscv013_wait_for_reset_condition(target, DM_DMSTATUS_ALLHAVERESET,
 			"leave reset", &dmstatus);
 	if (result != ERROR_OK)
 		return result;
 
-	/* If reset-halt was requested and hart is not unavailable,
-	 * wait for the hart to actually halt. */
-	if (target->reset_halt && !get_field(dmstatus, DM_DMSTATUS_ALLUNAVAIL)) {
-		result = riscv013_wait_for_reset_condition(target, DM_DMSTATUS_ALLHALTED,
-				"halt", &dmstatus);
-		if (result != ERROR_OK)
-			return result;
-	}
-
-	/* Ack reset and clear DM_DMCONTROL_HALTREQ if previously set */
-	control = set_field(riscv013_dmcontrol(target, false), DM_DMCONTROL_ACKHAVERESET, 1);
+	/* 3) ackhavereset; keep haltreq until halt is observed. */
+	control = set_field(riscv013_dmcontrol(target, target->reset_halt),
+			DM_DMCONTROL_ACKHAVERESET, 1);
 	result = dm_write(target, DM_DMCONTROL, control);
 	if (result != ERROR_OK)
 		return result;
 
+	if (target->reset_halt) {
+		result = deassert_reset_finish_haltreq(target, &dmstatus);
+		if (result != ERROR_OK)
+			return result;
+	}
+
+	/* 4) Publish OpenOCD target state from last dmstatus. */
 	if (get_field(dmstatus, DM_DMSTATUS_ALLUNAVAIL)) {
 		target->state = TARGET_UNAVAILABLE;
 	} else if (target->reset_halt) {
@@ -5260,6 +5319,20 @@ int riscv013_set_register(struct target *target, enum gdb_regno rid,
 	return register_write_direct(target, rid, value);
 }
 
+/* Whether hart_index has a haltreq latched by deassert_reset() while it
+ * was unavailable. haltreq is per hart: a dmcontrol write only changes it
+ * for the hart it selects, so only reselecting hart_index can clear it. */
+static bool dm013_hart_haltreq_pending(dm013_info_t *dm, int hart_index)
+{
+	struct target_list *entry;
+	list_for_each_entry(entry, &dm->target_list, lh) {
+		riscv013_info_t *info = get_info(entry->target);
+		if ((int)info->index == hart_index)
+			return info->haltreq_pending;
+	}
+	return false;
+}
+
 static int dm013_select_hart(struct target *target, int hart_index)
 {
 	dm013_info_t *dm = get_dm(target);
@@ -5275,6 +5348,9 @@ static int dm013_select_hart(struct target *target, int hart_index)
 
 	uint32_t dmcontrol = DM_DMCONTROL_DMACTIVE;
 	dmcontrol = set_dmcontrol_hartsel(dmcontrol, hart_index);
+	/* Preserve a haltreq deassert_reset() latched on this hart. */
+	if (dm013_hart_haltreq_pending(dm, hart_index))
+		dmcontrol = set_field(dmcontrol, DM_DMCONTROL_HALTREQ, 1);
 	if (dm_write(target, DM_DMCONTROL, dmcontrol) != ERROR_OK) {
 		/* Who knows what the state is? */
 		dm->current_hartid = HART_INDEX_UNKNOWN;
@@ -5527,6 +5603,10 @@ static int riscv013_step_or_resume_current_hart(struct target *target,
 
 	LOG_TARGET_DEBUG(target, "resuming (operation=%s)",
 		step ? "single-step" : "resume");
+
+	/* This hart is resuming; drop any latched haltreq from reset-halt. */
+	RISCV013_INFO(hart_info);
+	hart_info->haltreq_pending = false;
 
 	if (riscv_reg_flush_all(target) != ERROR_OK)
 		return ERROR_FAIL;
