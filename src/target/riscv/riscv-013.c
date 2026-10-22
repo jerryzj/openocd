@@ -2021,6 +2021,19 @@ static int examine_dm(struct target *target)
 	return ERROR_OK;
 }
 
+static bool smp_sibling_halted(const struct target *target)
+{
+	if (!target->smp)
+		return false;
+
+	struct target_list *entry;
+	foreach_smp_target(entry, target->smp_targets) {
+		if (entry->target != target && entry->target->state == TARGET_HALTED)
+			return true;
+	}
+	return false;
+}
+
 static int examine(struct target *target)
 {
 	/* We reset target state in case if something goes wrong during examine:
@@ -2196,7 +2209,10 @@ static int examine(struct target *target)
 	if (set_dcsr_config(target, false) != ERROR_OK)
 		return ERROR_FAIL;
 
-	if (state_at_examine_start == RISCV_STATE_RUNNING) {
+	/* A hart that shows up after the rest of its SMP group halted stays halted:
+	 * the next poll would halt it anyway, and a breakpoint/watchpoint insert
+	 * in between would fail with "not halted". */
+	if (state_at_examine_start == RISCV_STATE_RUNNING && !smp_sibling_halted(target)) {
 		riscv013_step_or_resume_current_hart(target, false);
 		target->state = TARGET_RUNNING;
 		target->debug_reason = DBG_REASON_NOTHALTED;
