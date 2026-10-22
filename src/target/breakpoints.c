@@ -239,6 +239,8 @@ int breakpoint_add(struct target *target,
 		struct target_list *list_node;
 		foreach_smp_target(list_node, target->smp_targets) {
 			struct target *curr = list_node->target;
+			if (curr->state == TARGET_UNAVAILABLE)
+				continue;
 			int retval = breakpoint_add_internal(curr, address, length, type);
 			if (retval != ERROR_OK)
 				return retval;
@@ -260,6 +262,8 @@ int context_breakpoint_add(struct target *target,
 
 		foreach_smp_target(head, target->smp_targets) {
 			struct target *curr = head->target;
+			if (curr->state == TARGET_UNAVAILABLE)
+				continue;
 			int retval = context_breakpoint_add_internal(curr, asid, length, type);
 			if (retval != ERROR_OK)
 				return retval;
@@ -282,6 +286,8 @@ int hybrid_breakpoint_add(struct target *target,
 
 		foreach_smp_target(head, target->smp_targets) {
 			struct target *curr = head->target;
+			if (curr->state == TARGET_UNAVAILABLE)
+				continue;
 			int retval = hybrid_breakpoint_add_internal(curr, address, asid, length, type);
 			if (retval != ERROR_OK)
 				return retval;
@@ -573,6 +579,8 @@ int watchpoint_add(struct target *target, target_addr_t address,
 
 		foreach_smp_target(head, target->smp_targets) {
 			struct target *curr = head->target;
+			if (curr->state == TARGET_UNAVAILABLE)
+				continue;
 			int retval = watchpoint_add_internal(curr, address, length, rw, value, mask);
 			if (retval != ERROR_OK)
 				return retval;
