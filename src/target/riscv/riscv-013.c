@@ -39,12 +39,14 @@ static int riscv013_on_step_or_resume(struct target *target, bool step);
 static uint32_t riscv013_dmcontrol(struct target *target, bool haltreq);
 static int riscv013_step_or_resume_current_hart(struct target *target,
 		bool step);
+static int step_or_resume_selected(struct target *target, bool step);
 static int riscv013_clear_abstract_error(struct target *target);
 
 /* Implementations of the functions in struct riscv_info. */
 static int dm013_select_hart(struct target *target, int hart_index);
 static int riscv013_halt_prep(struct target *target);
 static int riscv013_halt_go(struct target *target);
+static int riscv013_halt_one_hart(struct target *target);
 static int riscv013_halt_target(struct target *target);
 static int riscv013_resume_go(struct target *target);
 static int riscv013_step_current_hart(struct target *target);
@@ -109,6 +111,7 @@ typedef enum {
 #define CMDERR_HALT_RESUME		DM_ABSTRACTCS_CMDERR_HALT_RESUME
 #define CMDERR_OTHER			DM_ABSTRACTCS_CMDERR_OTHER
 
+#define HART_INDEX_MULTIPLE	-1
 #define HART_INDEX_UNKNOWN	-2
 
 typedef struct {
@@ -124,8 +127,10 @@ typedef struct {
 	bool was_reset;
 	/* Targets that are connected to this DM. */
 	struct list_head target_list;
-	/* Contains the ID of the hart that is currently selected by this DM. */
+	/* Contains the ID of the hart that is currently selected by this DM.
+	 * If multiple harts are selected this is HART_INDEX_MULTIPLE. */
 	int current_hartid;
+	bool hasel_supported;
 
 	/* The program buffer stores executable code. 0 is an illegal instruction,
 	 * so we use 0 to mean the cached value is invalid. */
@@ -252,6 +257,9 @@ typedef struct {
 	 * unavailable hart; dm013_select_hart() must preserve it until
 	 * cleared (on halt, or before resume/step). */
 	bool haltreq_pending;
+
+	/* This target was selected using hasel. */
+	bool selected;
 } riscv013_info_t;
 
 static OOCD_LIST_HEAD(dm_list);
@@ -391,6 +399,11 @@ static uint32_t set_dmcontrol_hartsel(uint32_t initial, int hart_index)
 		uint32_t index_hi = hart_index >> DM_DMCONTROL_HARTSELLO_LENGTH;
 		assert(index_hi < (1 << DM_DMCONTROL_HARTSELHI_LENGTH));
 		initial = set_field(initial, DM_DMCONTROL_HARTSELHI, index_hi);
+	} else if (hart_index == HART_INDEX_MULTIPLE) {
+		initial = set_field(initial, DM_DMCONTROL_HASEL, DM_DMCONTROL_HASEL_MULTIPLE);
+		/* hartsel stays selected; select_prepped_harts() includes hart 0. */
+		initial = set_field(initial, DM_DMCONTROL_HARTSELLO, 0);
+		initial = set_field(initial, DM_DMCONTROL_HARTSELHI, 0);
 	}
 
 	return initial;
@@ -1785,7 +1798,7 @@ static int halt_set_dcsr_config(struct target *target)
 	}
 
 	/* An unavailable hart is left to the next poll. */
-	int result = riscv013_halt_go(target);
+	int result = riscv013_halt_one_hart(target);
 	if (result == ERROR_TARGET_RESOURCE_NOT_AVAILABLE)
 		return ERROR_OK;
 	if (result != ERROR_OK || set_dcsr_config(target, false) != ERROR_OK)
@@ -1968,6 +1981,8 @@ static int examine_dm(struct target *target)
 	result = dm_read(target, &dmcontrol, DM_DMCONTROL);
 	if (result != ERROR_OK)
 		return result;
+
+	dm->hasel_supported = get_field(dmcontrol, DM_DMCONTROL_HASEL);
 
 	uint32_t hartsel =
 		(get_field(dmcontrol, DM_DMCONTROL_HARTSELHI) <<
@@ -5543,7 +5558,122 @@ static int riscv013_halt_prep(struct target *target)
 	return riscv013_set_haltgroup(target, target->smp_id);
 }
 
+static bool hasel_candidate(struct target *t, const dm013_info_t *dm)
+{
+	return target_was_examined(t) && riscv_info(t)->prepped && get_dm(t) == dm;
+}
+
+/* riscv013_halt_one_hart() and riscv013_step_or_resume_current_hart() handle
+ * one hart at a time, so the rest of an SMP group keeps running, or stays
+ * halted, for a while. With hasel, select all the group's prepped harts on
+ * this DM instead, so they halt or resume together.
+ * hartsel stays 0 while hasel selects multiple harts, and that hart is always
+ * part of the selection, so only do this when DM hart 0 is one of them.
+ * ponytail: an SMP group without DM hart 0 is still handled one hart at a
+ * time. Sets *selected when the harts were selected this way. */
+static int select_prepped_harts(struct target *target, bool *selected)
+{
+	*selected = false;
+	dm013_info_t *dm = get_dm(target);
+	if (!dm)
+		return ERROR_FAIL;
+	if (!target->smp || !dm->hasel_supported)
+		return ERROR_OK;
+
+	unsigned int hawindow_count = (dm->hart_count + 31) / 32;
+	uint32_t *hawindow = calloc(hawindow_count, sizeof(uint32_t));
+	if (!hawindow)
+		return ERROR_FAIL;
+
+	unsigned int count = 0;
+	bool hart0 = false;
+	struct target_list *entry;
+	foreach_smp_target(entry, target->smp_targets) {
+		if (!hasel_candidate(entry->target, dm))
+			continue;
+		unsigned int index = get_info(entry->target)->index;
+		hawindow[index / 32] |= 1 << (index % 32);
+		if (index == 0)
+			hart0 = true;
+		count++;
+	}
+
+	int result = ERROR_OK;
+	if (count > 1 && hart0) {
+		result = dm013_select_hart(target, HART_INDEX_MULTIPLE);
+		for (unsigned int i = 0; i < hawindow_count && result == ERROR_OK; i++) {
+			result = dm_write(target, DM_HAWINDOWSEL, i);
+			if (result == ERROR_OK)
+				result = dm_write(target, DM_HAWINDOW, hawindow[i]);
+		}
+		if (result == ERROR_OK) {
+			foreach_smp_target(entry, target->smp_targets)
+				get_info(entry->target)->selected = hasel_candidate(entry->target, dm);
+			*selected = true;
+		}
+	}
+	free(hawindow);
+	return result;
+}
+
 static int riscv013_halt_go(struct target *target)
+{
+	bool selected;
+	if (select_prepped_harts(target, &selected) != ERROR_OK)
+		return ERROR_FAIL;
+	if (!selected) {
+		/* Otherwise a later selection, e.g. to run an algorithm on another
+		 * hart, takes this hart along. */
+		riscv_info(target)->prepped = false;
+		return riscv013_halt_one_hart(target);
+	}
+
+	LOG_TARGET_DEBUG(target, "halting all prepped harts");
+	/* Like riscv013_halt_one_hart(), take them out of their halt group first,
+	 * so halting them doesn't halt the rest of the group. */
+	int result = ERROR_OK;
+	struct target_list *entry;
+	foreach_smp_target(entry, target->smp_targets) {
+		if (get_info(entry->target)->selected && result == ERROR_OK)
+			result = riscv013_set_haltgroup(entry->target, 0);
+	}
+	/* That selected single harts. hawindow still holds the selection. */
+	if (result == ERROR_OK)
+		result = dm013_select_hart(target, HART_INDEX_MULTIPLE);
+	if (result == ERROR_OK) {
+		result = riscv013_halt_target(target);
+		if (result != ERROR_OK && result != ERROR_TARGET_RESOURCE_NOT_AVAILABLE)
+			result = ERROR_FAIL;
+	}
+
+	/* riscv013_halt_target() only looked at the selected harts together.
+	 * Clear prepped so riscv_halt() doesn't halt them again. */
+	foreach_smp_target(entry, target->smp_targets) {
+		struct target *t = entry->target;
+		riscv013_info_t *info = get_info(t);
+		if (!info->selected)
+			continue;
+		info->selected = false;
+		riscv_info(t)->prepped = false;
+
+		uint32_t dmstatus;
+		if (dm013_select_target(t) != ERROR_OK ||
+				dm_read(t, &dmstatus, DM_DMSTATUS) != ERROR_OK) {
+			result = ERROR_FAIL;
+			continue;
+		}
+		if (get_field(dmstatus, DM_DMSTATUS_ALLHALTED)) {
+			t->state = TARGET_HALTED;
+			if (t->debug_reason == DBG_REASON_NOTHALTED)
+				t->debug_reason = DBG_REASON_DBGRQ;
+		} else if (get_field(dmstatus, DM_DMSTATUS_ALLUNAVAIL)) {
+			t->state = TARGET_UNAVAILABLE;
+		}
+	}
+	return result;
+}
+
+static int riscv013_halt_one_hart(struct target *target)
 {
 	LOG_TARGET_DEBUG(target, "halting hart");
 
@@ -5558,7 +5688,7 @@ static int riscv013_halt_go(struct target *target)
 
 static int riscv013_halt_target(struct target *target)
 {
-	LOG_TARGET_DEBUG(target, "halting one hart");
+	LOG_TARGET_DEBUG(target, "sending haltreq");
 
 	/* `haltreq` should not be issued if `abstractcs.busy` is set. */
 	int result = wait_for_idle_if_needed(target);
@@ -5608,7 +5738,43 @@ static int riscv013_halt_target(struct target *target)
 
 static int riscv013_resume_go(struct target *target)
 {
-	return riscv013_step_or_resume_current_hart(target, false);
+	bool selected;
+	if (select_prepped_harts(target, &selected) != ERROR_OK)
+		return ERROR_FAIL;
+	if (!selected) {
+		/* Like in riscv013_halt_go(). */
+		riscv_info(target)->prepped = false;
+		return riscv013_step_or_resume_current_hart(target, false);
+	}
+
+	/* resume_prep() already flushed the registers of the selected harts.
+	 * Clear prepped so riscv_resume() doesn't resume them again. */
+	LOG_TARGET_DEBUG(target, "resuming all prepped harts");
+	struct target_list *entry;
+	foreach_smp_target(entry, target->smp_targets) {
+		riscv013_info_t *info = get_info(entry->target);
+		if (info->selected) {
+			info->haltreq_pending = false;
+			riscv_info(entry->target)->prepped = false;
+		}
+	}
+	/* ponytail: a selected hart that becomes unavailable while resuming makes
+	 * this time out like a failed resume; the next poll sorts out the states. */
+	int result = step_or_resume_selected(target, false);
+	foreach_smp_target(entry, target->smp_targets) {
+		riscv013_info_t *info = get_info(entry->target);
+		if (!info->selected)
+			continue;
+		info->selected = false;
+		/* Like riscv013_step_or_resume_current_hart(), put it back with the
+		 * running harts. */
+		if (result == ERROR_OK)
+			result = riscv013_set_haltgroup(entry->target, entry->target->smp_id);
+	}
+	/* Don't leave all of them selected for whatever comes next. */
+	if (dm013_select_target(target) != ERROR_OK)
+		return ERROR_FAIL;
+	return result;
 }
 
 static int riscv013_step_current_hart(struct target *target)
@@ -5791,6 +5957,12 @@ static int riscv013_step_or_resume_current_hart(struct target *target,
 	if (dm013_select_target(target) != ERROR_OK)
 		return ERROR_FAIL;
 
+	return step_or_resume_selected(target, step);
+}
+
+/* Step or resume the harts selected on the DM, and wait for them. */
+static int step_or_resume_selected(struct target *target, bool step)
+{
 	dm013_info_t *dm = get_dm(target);
 	/* Issue the resume command, and then wait for the current hart to resume. */
 	uint32_t dmcontrol = DM_DMCONTROL_DMACTIVE | DM_DMCONTROL_RESUMEREQ;
@@ -5813,8 +5985,14 @@ static int riscv013_step_or_resume_current_hart(struct target *target,
 			return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
 		}
 		if (get_field(dmstatus, DM_DMSTATUS_ANYHAVERESET)) {
-			/* The reset cleared what set_dcsr_config() wrote. */
+			/* The reset cleared what set_dcsr_config() wrote. Any of the
+			 * harts selected with hasel may have been reset. */
 			get_info(target)->dcsr_register_is_set = false;
+			struct target_list *entry;
+			foreach_smp_target(entry, target->smp_targets) {
+				if (get_info(entry->target)->selected)
+					get_info(entry->target)->dcsr_register_is_set = false;
+			}
 			dmcontrol = dmcontrol | DM_DMCONTROL_ACKHAVERESET;
 		}
 		if (get_field(dmstatus, DM_DMSTATUS_ALLRESUMEACK) == 0)
