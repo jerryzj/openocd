@@ -1116,15 +1116,18 @@ static int gdb_new_connection(struct connection *connection)
 			target_name(target),
 			target_state_name(target));
 
-	if (!target_was_examined(target)) {
+	/* In an SMP group, gdb can work through another target if this one is
+	 * unavailable and was never examined. */
+	struct target *available = get_available_target_from_connection(connection);
+	if (!target_was_examined(available)) {
 		LOG_TARGET_ERROR(target, "Target not examined yet, refuse gdb connection %d!",
 				  gdb_connection->unique_index);
 		return ERROR_TARGET_NOT_EXAMINED;
 	}
 	gdb_actual_connections++;
 
-	if (target->state != TARGET_HALTED)
-		LOG_TARGET_WARNING(target, "GDB connection %d not halted",
+	if (available->state != TARGET_HALTED)
+		LOG_TARGET_WARNING(available, "GDB connection %d not halted",
 					gdb_actual_connections);
 
 	/* DANGER! If we fail subsequently, we must remove this handler,
@@ -1189,7 +1192,7 @@ static void gdb_send_error(struct connection *connection, uint8_t the_error)
 static int gdb_last_signal_packet(struct connection *connection,
 		char const *packet, int packet_size)
 {
-	struct target *target = get_target_from_connection(connection);
+	struct target *target = get_available_target_from_connection(connection);
 	struct gdb_connection *gdb_con = connection->priv;
 	char sig_reply[4];
 	int signal_var;
@@ -3181,7 +3184,8 @@ static int gdb_query_packet(struct connection *connection,
 		bool gdb_target_desc_supported = false;
 
 		/* we need to test that the target supports target descriptions */
-		retval = gdb_target_description_supported(target, &gdb_target_desc_supported);
+		retval = gdb_target_description_supported(get_available_target_from_connection(connection),
+				&gdb_target_desc_supported);
 		if (retval != ERROR_OK) {
 			LOG_INFO("Failed detecting Target Description Support, disabling");
 			gdb_target_desc_supported = false;
@@ -3241,8 +3245,8 @@ static int gdb_query_packet(struct connection *connection,
 		 * there are *more* chunks to transfer. 'l' for it is the *last*
 		 * chunk of target description.
 		 */
-		retval = gdb_get_target_description_chunk(target, &gdb_connection->target_desc,
-				&xml, offset, length);
+		retval = gdb_get_target_description_chunk(get_available_target_from_connection(connection),
+				&gdb_connection->target_desc, &xml, offset, length);
 		if (retval != ERROR_OK) {
 			gdb_error(connection, retval);
 			return retval;

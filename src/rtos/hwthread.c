@@ -410,7 +410,12 @@ static int hwthread_thread_packet(struct connection *connection, const char *pac
 			}
 			target->rtos->current_thread = current_threadid;
 		} else if (current_threadid == 0 || current_threadid == -1) {
-			target->rtos->current_thread = threadid_from_target(target);
+			struct target *available = target_smp_available(target);
+			target->rtos->current_thread = threadid_from_target(available);
+			/* Without a thread, registers are accessed on this target, which
+			 * is no longer the thread gdb takes as current. */
+			if (available != target)
+				current_threadid = target->rtos->current_thread;
 		}
 
 		target->rtos->current_threadid = current_threadid;
