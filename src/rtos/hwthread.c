@@ -106,7 +106,9 @@ static int hwthread_update_threads(struct rtos *rtos)
 	/* wipe out previous thread details if any */
 	rtos_free_threadlist(rtos);
 
-	/* determine the number of "threads" */
+	/* determine the number of "threads", and whether the thread selected by
+	 * GDB is still one of them */
+	bool selected_listed = current_threadid <= 0;
 	if (target->smp) {
 		foreach_smp_target(head, target->smp_targets) {
 			struct target *curr = head->target;
@@ -116,14 +118,20 @@ static int hwthread_update_threads(struct rtos *rtos)
 				continue;
 
 			++thread_list_size;
+			if (threadid_from_target(curr) == current_threadid)
+				selected_listed = true;
 		}
-	} else
+	} else {
 		thread_list_size = 1;
+		if (current_threadid == 1)
+			selected_listed = true;
+	}
 
 	/* restore the threadid which is currently selected by GDB
 	 * because rtos_free_threadlist() wipes out it
-	 * (GDB thread id is 1-based indexing) */
-	if (current_threadid <= thread_list_size)
+	 * (GDB thread id is 1-based indexing, and a thread keeps its id while
+	 * SMP members before it aren't listed) */
+	if (selected_listed)
 		rtos->current_threadid = current_threadid;
 	else
 		LOG_TARGET_WARNING(target, "SMP node change, disconnect GDB from core/thread %" PRId64,
