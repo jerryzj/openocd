@@ -2279,7 +2279,9 @@ static int riscv013_authdata_write(struct target *target, uint32_t value, unsign
 			return ERROR_FAIL;
 		struct target_list *entry;
 		list_for_each_entry(entry, &dm->target_list, lh) {
-			if (target_examine_one(entry->target) != ERROR_OK)
+			/* An unavailable hart is examined once it becomes available. */
+			if (target_examine_one(entry->target) != ERROR_OK &&
+					entry->target->state != TARGET_UNAVAILABLE)
 				result = ERROR_FAIL;
 		}
 		return result;
