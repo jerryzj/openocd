@@ -10052,6 +10052,8 @@ Otherwise these behave the same: wait up to @var{ms} milliseconds,
 or 5 seconds if there is no parameter, for the target to halt
 (and enter debug mode).
 Using 0 as the @var{ms} parameter prevents OpenOCD from waiting.
+If the target is unavailable and part of an SMP group, both commands use an
+available target of the group instead.
 
 @quotation Warning
 On ARM cores, software using the @emph{wait for interrupt} operation

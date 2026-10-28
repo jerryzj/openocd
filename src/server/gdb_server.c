@@ -152,27 +152,13 @@ static bool gdb_use_target_description = true;
 /* current processing free-run type, used by file-I/O */
 static char gdb_running_type;
 
-/* Find an available target in the SMP group that gdb is connected to. For
- * commands that affect an entire SMP group (like memory access and run control)
- * this will give better results than returning the unavailable target and having
- * the command fail.  If gdb was aware that targets can be unavailable we
- * wouldn't need this logic.
+/* Find an available target in the SMP group that gdb is connected to. If gdb
+ * was aware that targets can be unavailable we wouldn't need this logic.
  */
 struct target *get_available_target_from_connection(struct connection *connection)
 {
 	struct gdb_service *gdb_service = connection->service->priv;
-	struct target *target = gdb_service->target;
-	if (target->state == TARGET_UNAVAILABLE && target->smp) {
-		struct target_list *tlist;
-		foreach_smp_target(tlist, target->smp_targets) {
-			struct target *t = tlist->target;
-			if (t->state != TARGET_UNAVAILABLE)
-				return t;
-		}
-		/* If we can't find an available target, just return the
-		 * original. */
-	}
-	return target;
+	return target_smp_available(gdb_service->target);
 }
 
 /** Return true iff the given connection includes the given target. */

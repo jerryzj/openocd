@@ -549,6 +549,26 @@ int target_halt(struct target *target)
 	return ERROR_OK;
 }
 
+/* Find an available target in the SMP group of an unavailable target. For
+ * commands that affect an entire SMP group (like memory access and run control)
+ * this will give better results than using the unavailable target and having
+ * the command fail. A target that is unavailable may never have been examined.
+ */
+struct target *target_smp_available(struct target *target)
+{
+	if (target->state == TARGET_UNAVAILABLE && target->smp) {
+		struct target_list *tlist;
+		foreach_smp_target(tlist, target->smp_targets) {
+			struct target *t = tlist->target;
+			if (t->state != TARGET_UNAVAILABLE && target_was_examined(t))
+				return t;
+		}
+		/* If we can't find an available target, just return the
+		 * original. */
+	}
+	return target;
+}
+
 /**
  * Make the target (re)start executing using its saved execution
  * context (possibly with some modifications).
@@ -3256,7 +3276,8 @@ COMMAND_HANDLER(handle_wait_halt_command)
 			return ERROR_COMMAND_SYNTAX_ERROR;
 	}
 
-	struct target *target = get_current_target(CMD_CTX);
+	/* An unavailable target won't halt, but its SMP group can. */
+	struct target *target = target_smp_available(get_current_target(CMD_CTX));
 	return target_wait_state(target, TARGET_HALTED, ms);
 }
 
@@ -3302,7 +3323,7 @@ COMMAND_HANDLER(handle_halt_command)
 {
 	LOG_DEBUG("-");
 
-	struct target *target = get_current_target(CMD_CTX);
+	struct target *target = target_smp_available(get_current_target(CMD_CTX));
 
 	target->verbose_halt_msg = true;
 

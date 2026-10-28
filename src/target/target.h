@@ -396,6 +396,7 @@ int target_poll(struct target *target);
 int target_resume(struct target *target, bool current, target_addr_t address,
 		bool handle_breakpoints, bool debug_execution);
 int target_halt(struct target *target);
+struct target *target_smp_available(struct target *target);
 int target_call_event_callbacks(struct target *target, enum target_event event);
 int target_call_reset_callbacks(struct target *target, enum target_reset_mode reset_mode);
 int target_call_trace_callbacks(struct target *target, size_t len, uint8_t *data);
