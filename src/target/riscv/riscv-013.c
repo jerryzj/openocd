@@ -52,6 +52,7 @@ static int riscv013_resume_go(struct target *target);
 static int riscv013_step_current_hart(struct target *target);
 static int riscv013_on_step(struct target *target);
 static int riscv013_resume_prep(struct target *target);
+static int riscv013_cancel_halt_request(struct target *target);
 static enum riscv_halt_reason riscv013_halt_reason(struct target *target);
 static int riscv013_write_progbuf(struct target *target, unsigned int index,
 		riscv_insn_t d);
@@ -2960,6 +2961,7 @@ static int init_target(struct command_context *cmd_ctx,
 	generic_info->resume_go = &riscv013_resume_go;
 	generic_info->step_current_hart = &riscv013_step_current_hart;
 	generic_info->resume_prep = &riscv013_resume_prep;
+	generic_info->cancel_halt_request = &riscv013_cancel_halt_request;
 	generic_info->halt_prep = &riscv013_halt_prep;
 	generic_info->halt_go = &riscv013_halt_go;
 	generic_info->on_step = &riscv013_on_step;
@@ -5786,6 +5788,22 @@ static int riscv013_resume_prep(struct target *target)
 {
 	assert(target->state == TARGET_HALTED);
 	return riscv013_on_step_or_resume(target, false);
+}
+
+/* Drop a haltreq deassert_reset() left latched on a hart that was
+ * unavailable, now that the rest of its group resumes without it. */
+static int riscv013_cancel_halt_request(struct target *target)
+{
+	RISCV013_INFO(info);
+	if (!info->haltreq_pending)
+		return ERROR_OK;
+
+	LOG_TARGET_DEBUG(target, "dropping reset-halt haltreq");
+	info->haltreq_pending = false;
+	/* dm013_select_target() doesn't write dmcontrol if the hart is selected. */
+	if (dm013_select_target(target) != ERROR_OK)
+		return ERROR_FAIL;
+	return dm_write(target, DM_DMCONTROL, riscv013_dmcontrol(target, false));
 }
 
 static int riscv013_on_step(struct target *target)

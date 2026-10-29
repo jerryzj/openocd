@@ -3080,9 +3080,13 @@ static int riscv_resume(struct target *target,
 		LOG_TARGET_DEBUG(t, "target->state=%s", target_state_name(t));
 		/* Don't resume a hart left prepped by an earlier, unfinished sequence. */
 		riscv_info(t)->prepped = false;
-		if (t->state != TARGET_HALTED)
+		if (t->state != TARGET_HALTED) {
 			LOG_TARGET_DEBUG(t, "skipping this target: target not halted");
-		else if (resume_prep(t, current, address, handle_breakpoints,
+			/* Before any hart of the group runs and can bring this one up. */
+			if (riscv_info(t)->cancel_halt_request &&
+					riscv_info(t)->cancel_halt_request(t) != ERROR_OK)
+				result = ERROR_FAIL;
+		} else if (resume_prep(t, current, address, handle_breakpoints,
 					debug_execution) != ERROR_OK)
 			result = ERROR_FAIL;
 	}

@@ -292,6 +292,10 @@ struct riscv_info {
 	/* Get this target as ready as possible to resume, without actually
 	 * resuming. */
 	int (*resume_prep)(struct target *target);
+	/* Optional. Called for a target that its group resumes without it (e.g.
+	 * it's unavailable), so it runs when it shows up instead of halting on a
+	 * request left from reset halt. */
+	int (*cancel_halt_request)(struct target *target);
 	int (*halt_prep)(struct target *target);
 	int (*halt_go)(struct target *target);
 	int (*on_step)(struct target *target);
