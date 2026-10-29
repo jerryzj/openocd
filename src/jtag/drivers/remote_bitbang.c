@@ -321,19 +321,19 @@ static int remote_bitbang_init_tcp(void)
 		close(fd);
 	}
 
-	/* We work hard to collapse the writes into the minimum number, so when
-	 * we write something we want to get it to the other end of the
-	 * connection as fast as possible. */
-	int one = 1;
-	/* On Windows optval has to be a const char *. */
-	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
-
 	freeaddrinfo(result); /* No longer needed */
 
 	if (!rp) { /* No address succeeded */
 		log_socket_error("Failed to connect");
 		return ERROR_FAIL;
 	}
+
+	/* We work hard to collapse the writes into the minimum number, so when
+	 * we write something we want to get it to the other end of the
+	 * connection as fast as possible. */
+	int one = 1;
+	/* On Windows optval has to be a const char *. */
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
 
 	return fd;
 }
